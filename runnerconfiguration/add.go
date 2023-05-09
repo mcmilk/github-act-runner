@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ChristopherHX/github-act-runner/common"
 	"github.com/ChristopherHX/github-act-runner/protocol"
 	"github.com/google/uuid"
 )
@@ -138,7 +139,7 @@ func (config *ConfigureRunner) Configure(settings *RunnerSettings, survey Survey
 	}
 	taskAgent.MaxParallelism = 1
 	taskAgent.ProvisioningState = "Provisioned"
-	taskAgent.CreatedOn = time.Now().UTC().Format("2006-01-02T15:04:05")
+	taskAgent.CreatedOn = time.Now().UTC().Format(protocol.TimestampOutputFormat)
 	taskAgent.Ephemeral = config.Ephemeral
 	{
 		err := vssConnection.Request("e298ef32-5878-4cab-993c-043836571f42", "6.0-preview.2", "POST", map[string]string{
@@ -185,8 +186,8 @@ func (config *ConfigureRunner) Configure(settings *RunnerSettings, survey Survey
 func (config *ConfigureRunner) ReadFromEnvironment() {
 	config.ConfigureRemoveRunner.ReadFromEnvironment()
 	if !config.Ephemeral {
-		if v, ok := os.LookupEnv("ACTIONS_RUNNER_INPUT_EPHEMERAL"); ok {
-			config.Ephemeral = strings.EqualFold(v, "true") || strings.EqualFold(v, "Y")
+		if v, ok := common.LookupEnvBool("ACTIONS_RUNNER_INPUT_EPHEMERAL"); ok {
+			config.Ephemeral = v
 		}
 	}
 	if len(config.Name) == 0 {
@@ -200,8 +201,8 @@ func (config *ConfigureRunner) ReadFromEnvironment() {
 		}
 	}
 	if !config.Replace {
-		if v, ok := os.LookupEnv("ACTIONS_RUNNER_INPUT_REPLACE"); ok {
-			config.Replace = strings.EqualFold(v, "true") || strings.EqualFold(v, "Y")
+		if v, ok := common.LookupEnvBool("ACTIONS_RUNNER_INPUT_REPLACE"); ok {
+			config.Replace = v
 		}
 	}
 }

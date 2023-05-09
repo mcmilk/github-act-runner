@@ -11,12 +11,12 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/ChristopherHX/github-act-runner/common"
 	"github.com/google/uuid"
 )
 
@@ -55,12 +55,12 @@ func (vssConnection *VssConnection) BuildURL(relativePath string, ppath map[stri
 	return url2.String(), nil
 }
 
-func (vssConnection *VssConnection) httpClient() *http.Client {
+func (vssConnection *VssConnection) HttpClient() *http.Client {
 	if vssConnection.Client == nil {
 		customTransport := http.DefaultTransport.(*http.Transport).Clone()
 		customTransport.MaxIdleConns = 1
 		customTransport.IdleConnTimeout = 100 * time.Second
-		if v, ok := os.LookupEnv("SKIP_TLS_CERT_VALIDATION"); ok && strings.EqualFold(v, "true") || strings.EqualFold(v, "Y") {
+		if v, ok := common.LookupEnvBool("SKIP_TLS_CERT_VALIDATION"); ok && v {
 			customTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 		}
 		vssConnection.Client = &http.Client{
@@ -74,7 +74,7 @@ func (vssConnection *VssConnection) httpClient() *http.Client {
 func (vssConnection *VssConnection) authorize() (*VssOAuthTokenResponse, error) {
 	var authResponse *VssOAuthTokenResponse
 	var err error
-	authResponse, err = vssConnection.TaskAgent.Authorize(vssConnection.httpClient(), vssConnection.Key)
+	authResponse, err = vssConnection.TaskAgent.Authorize(vssConnection.HttpClient(), vssConnection.Key)
 	if err == nil {
 		return authResponse, nil
 	}
@@ -85,25 +85,6 @@ func (vssConnection *VssConnection) Request(serviceID string, protocol string, m
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	return vssConnection.RequestWithContext(ctx, serviceID, protocol, method, urlParameter, queryParameter, requestBody, responseBody)
-}
-
-func AddContentType(header http.Header, apiversion string) {
-	if len(apiversion) > 0 {
-		header["Content-Type"] = []string{"application/json; charset=utf-8; api-version=" + apiversion}
-		header["Accept"] = []string{"application/json; api-version=" + apiversion}
-	}
-}
-
-func AddBearer(header http.Header, token string) {
-	if len(token) > 0 {
-		header["Authorization"] = []string{"bearer " + token}
-	}
-}
-
-func AddHeaders(header http.Header) {
-	header["X-VSS-E2EID"] = []string{uuid.NewString()}
-	header["X-TFS-FedAuthRedirect"] = []string{"Suppress"}
-	header["X-TFS-Session"] = []string{uuid.NewString()}
 }
 
 func (vssConnection *VssConnection) GetServiceURL(ctx context.Context, serviceID string, urlParameter map[string]string, queryParameter map[string]string) (string, error) {
@@ -149,19 +130,19 @@ func (vssConnection *VssConnection) RequestWithContext(ctx context.Context, serv
 	return vssConnection.RequestWithContext2(ctx, method, url, protocol, requestBody, responseBody)
 }
 
-func extractReader(body interface{}) (io.Reader, error) {
+func extractReader(body interface{}) (io.Reader, []string, error) {
 	if body == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if buf, ok := body.(*bytes.Buffer); ok {
-		return buf, nil
+		return buf, []string{"application/octet-stream"}, nil
 	}
 	buf := new(bytes.Buffer)
 	enc := json.NewEncoder(buf)
 	if err := enc.Encode(body); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return buf, nil
+	return buf, []string{"application/json; charset=utf-8"}, nil
 }
 
 func getHeadersAsString(header http.Header) string {
@@ -198,23 +179,57 @@ func setResponseBody(r io.Reader, body interface{}) error {
 	return nil
 }
 
-func (vssConnection *VssConnection) requestWithContextNoAuth(ctx context.Context, method string, url string, protocol string, requestBody interface{}, responseBody interface{}) (int, error) {
-	buf, err := extractReader(requestBody)
+func (vssConnection *VssConnection) requestWithContextNoAuth(ctx context.Context, method string, requesturl string, apiversion string, requestBody interface{}, responseBody interface{}) (int, error) {
+	buf, reqContentType, err := extractReader(requestBody)
 	if err != nil {
 		return 0, err
 	}
-	request, err := http.NewRequestWithContext(ctx, method, url, buf)
+	if len(apiversion) > 0 {
+		// vssservice always needs a version, even if there is no content
+		if requrl, err := url.Parse(requesturl); err == nil {
+			query := requrl.Query()
+			query.Set("api-version", apiversion)
+			requrl.RawQuery = query.Encode()
+			requesturl = requrl.String()
+		}
+	}
+	request, err := http.NewRequestWithContext(ctx, method, requesturl, buf)
 	if err != nil {
 		return 0, err
 	}
-	AddContentType(request.Header, protocol)
-	AddHeaders(request.Header)
-	AddBearer(request.Header, vssConnection.Token)
+	header := request.Header
+	contentTypeHeader := http.CanonicalHeaderKey("Content-Type")
+	acceptHeader := http.CanonicalHeaderKey("Accept")
+	if len(reqContentType) > 0 {
+		header[contentTypeHeader] = reqContentType
+	}
+	if responseBody != nil {
+		if _, ok := responseBody.(*[]byte); ok {
+			header.Set(acceptHeader, "application/octet-stream")
+		} else {
+			header.Set(acceptHeader, "application/json")
+		}
+	}
+	if len(apiversion) > 0 {
+		// vssservice does only accept contenttype in a single line
+		if len(header[contentTypeHeader]) > 0 {
+			header[contentTypeHeader][0] += "; api-version=" + apiversion
+		}
+		if len(header[acceptHeader]) > 0 {
+			header[acceptHeader][0] += "; api-version=" + apiversion
+		}
+		header["X-VSS-E2EID"] = []string{uuid.NewString()}
+		header["X-TFS-FedAuthRedirect"] = []string{"Suppress"}
+		header["X-TFS-Session"] = []string{uuid.NewString()}
+	}
+	if len(vssConnection.Token) > 0 {
+		header["Authorization"] = []string{"bearer " + vssConnection.Token}
+	}
 	if vssConnection.Trace {
-		fmt.Printf("Http %v Request started %v\nHeaders:\n%v\nBody: `%v`\n", method, url, getHeadersAsString(request.Header), getBodyAsString(buf))
+		fmt.Printf("Http %v Request started %v\nHeaders:\n%v\nBody: `%v`\n", method, requesturl, getHeadersAsString(request.Header), getBodyAsString(buf))
 	}
 
-	response, err := vssConnection.httpClient().Do(request)
+	response, err := vssConnection.HttpClient().Do(request)
 	if err != nil {
 		return 0, err
 	}
@@ -236,7 +251,7 @@ func (vssConnection *VssConnection) requestWithContextNoAuth(ctx context.Context
 			}
 		}
 	}
-	traceMessage := fmt.Sprintf("Http %v Request finished %v %v\nHeaders: \n%v\nBody: `%v`\n", method, response.StatusCode, url, getHeadersAsString(response.Header), string(rbytes))
+	traceMessage := fmt.Sprintf("Http %v Request finished %v %v\nHeaders: \n%v\nBody: `%v`\n", method, response.StatusCode, requesturl, getHeadersAsString(response.Header), string(rbytes))
 	if vssConnection.Trace {
 		fmt.Print(traceMessage)
 	}
@@ -315,8 +330,8 @@ func (vssConnection *VssConnection) UploadLogFile(timelineID string, jobreq *Age
 	log := &TaskLog{}
 	p := "logs/" + uuid.NewString()
 	log.Path = &p
-	log.CreatedOn = time.Now().UTC().Format("2006-01-02T15:04:05")
-	log.LastChangedOn = time.Now().UTC().Format("2006-01-02T15:04:05")
+	log.CreatedOn = time.Now().UTC().Format(TimestampOutputFormat)
+	log.LastChangedOn = time.Now().UTC().Format(TimestampOutputFormat)
 
 	err := vssConnection.Request("46f5667d-263a-4684-91b1-dff7fdcf64e2", "5.1-preview", "POST", map[string]string{
 		"scopeIdentifier": jobreq.Plan.ScopeIdentifier,

@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"runtime"
 	"runtime/debug"
@@ -19,7 +18,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ChristopherHX/github-act-runner/common"
 	"github.com/ChristopherHX/github-act-runner/protocol"
+	runservice "github.com/ChristopherHX/github-act-runner/protocol/run"
 	"github.com/ChristopherHX/github-act-runner/runnerconfiguration"
 	"github.com/sirupsen/logrus"
 )
@@ -155,7 +156,7 @@ func (run *RunRunner) Run(runnerenv RunnerEnvironment, listenerctx context.Conte
 				customTransport := http.DefaultTransport.(*http.Transport).Clone()
 				customTransport.MaxIdleConns = 1
 				customTransport.IdleConnTimeout = 100 * time.Second
-				if v, ok := os.LookupEnv("SKIP_TLS_CERT_VALIDATION"); ok && strings.EqualFold(v, "true") || strings.EqualFold(v, "Y") {
+				if v, ok := common.LookupEnvBool("SKIP_TLS_CERT_VALIDATION"); ok && v {
 					customTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 				}
 				vssConnection := &protocol.VssConnection{
@@ -222,7 +223,9 @@ func (run *RunRunner) Run(runnerenv RunnerEnvironment, listenerctx context.Conte
 				}
 				deleteSession := func() {
 					if session != nil {
-						if err := session.Delete(joblisteningctx); err != nil {
+						timeout, cancelT := context.WithTimeout(context.Background(), time.Minute)
+						defer cancelT()
+						if err := session.Delete(timeout); err != nil {
 							runnerenv.Printf("WARNING: Failed to delete active session: %v\n", err)
 						} else {
 							mu.Lock()
@@ -406,15 +409,11 @@ type RunnerJobRequestRef struct {
 	RunServiceUrl   string `json:"run_service_url"`
 }
 
-type RunnerServicePayload struct {
-	StreamID string `json:"streamID"`
-}
-
 type plainTextFormatter struct {
 }
 
 func (f *plainTextFormatter) Format(entry *logrus.Entry) ([]byte, error) {
-	return []byte(entry.Time.UTC().Format("2006-01-02T15:04:05.0000000Z ") + entry.Message + "\n"), nil
+	return []byte(entry.Time.UTC().Format(protocol.TimestampOutputFormat) + " " + entry.Message + "\n"), nil
 }
 
 func runJob(runnerenv RunnerEnvironment, joblock *sync.Mutex, vssConnection *protocol.VssConnection, run *RunRunner, cancel context.CancelFunc, cancelJob context.CancelFunc, finishJob context.CancelFunc, jobExecCtx context.Context, jobctx context.Context, session *protocol.AgentMessageConnection, message protocol.TaskAgentMessage, instance *runnerconfiguration.RunnerInstance) {
@@ -459,8 +458,9 @@ func runJob(runnerenv RunnerEnvironment, joblock *sync.Mutex, vssConnection *pro
 						acquirejobUrl, _ := url.Parse(runServiceUrl)
 						acquirejobUrl.Path = path.Join(acquirejobUrl.Path, "acquirejob")
 						vssConnection.TenantURL = runServiceUrl
-						payload := &RunnerServicePayload{
-							StreamID: rjrr.RunnerRequestId,
+						payload := &runservice.AcquireJobRequest{
+							StreamID:     rjrr.RunnerRequestId,
+							JobMessageID: rjrr.RunnerRequestId,
 						}
 						err = vssConnection.RequestWithContext2(jobctx, "POST", acquirejobUrl.String(), "", payload, &src)
 					}
@@ -491,12 +491,26 @@ func runJob(runnerenv RunnerEnvironment, joblock *sync.Mutex, vssConnection *pro
 		con := *vssConnection
 		go func() {
 			for {
-				err := con.RequestWithContext(jobctx, "fc825784-c92a-4299-9221-998a02d1b54f", "5.1-preview", "PATCH", map[string]string{
-					"poolId":    fmt.Sprint(instance.PoolID),
-					"requestId": fmt.Sprint(jobreq.RequestID),
-				}, map[string]string{
-					"lockToken": "00000000-0000-0000-0000-000000000000",
-				}, &protocol.RenewAgent{RequestID: jobreq.RequestID}, nil)
+				var err error
+				if runServiceUrl != "" {
+					vssConnection = &con
+					renewjobUrl, _ := url.Parse(runServiceUrl)
+					renewjobUrl.Path = path.Join(renewjobUrl.Path, "renewjob")
+					vssConnection.TenantURL = runServiceUrl
+					payload := &runservice.RenewJobRequest{
+						PlanID: jobreq.Plan.PlanID,
+						JobID:  jobreq.JobID,
+					}
+					resp := &runservice.RenewJobResponse{}
+					err = vssConnection.RequestWithContext2(jobctx, "POST", renewjobUrl.String(), "", payload, &resp)
+				} else {
+					err = con.RequestWithContext(jobctx, "fc825784-c92a-4299-9221-998a02d1b54f", "5.1-preview", "PATCH", map[string]string{
+						"poolId":    fmt.Sprint(instance.PoolID),
+						"requestId": fmt.Sprint(jobreq.RequestID),
+					}, map[string]string{
+						"lockToken": "00000000-0000-0000-0000-000000000000",
+					}, &protocol.RenewAgent{RequestID: jobreq.RequestID}, nil)
+				}
 				if err != nil {
 					if errors.Is(err, context.Canceled) {
 						return
@@ -528,7 +542,7 @@ func runJob(runnerenv RunnerEnvironment, joblock *sync.Mutex, vssConnection *pro
 
 		defer func() {
 			if err := recover(); err != nil {
-				wc.FailInitJob("Worker paniced", "The worker paniced with message: "+fmt.Sprint(err)+"\n"+string(debug.Stack()))
+				wc.FailInitJob("Worker panicked", "The worker panicked with message: "+fmt.Sprint(err)+"\n"+string(debug.Stack()))
 			}
 			runnerenv.Remove("jobrun.json")
 		}()
